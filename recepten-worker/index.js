@@ -340,8 +340,9 @@ async function extractViaVideo(env, videoUrl) {
   const prompt =
     "Bekijk deze kookvideo (beeld en audio) en haal het complete recept eruit. " +
     "Let ook op hoeveelheden die alleen in beeld getoond worden.\n\n" + RECEPT_REGELS +
-    "\n- Geef bij elke stap 'start': het tijdstip in HELE SECONDEN vanaf het begin van de " +
-    "video waarop die stap begint. Gebruik -1 als je het tijdstip niet zeker weet.";
+    "\n- Geef bij elke stap 'start': het tijdstip in HELE SECONDEN vanaf het begin van de video " +
+    "waarop de kok deze handeling daadwerkelijk begint uit te voeren (niet waar het alleen wordt " +
+    "aangekondigd of nabesproken). Wees zo nauwkeurig mogelijk. Gebruik -1 als je het niet zeker weet.";
   return roepGemini(env, {
     contents: [{ parts: [{ file_data: { file_uri: videoUrl } }, { text: prompt }] }],
     generationConfig: { responseMimeType: "application/json", responseSchema: RECEPT_SCHEMA },

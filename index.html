@@ -176,6 +176,7 @@
   .kook-video{width:100%; aspect-ratio:16/9; border-radius:16px; overflow:hidden; background:#000; flex:0 0 auto;}
   .kook-video iframe{width:100%; height:100%; border:0; display:block;}
   .kook-video:empty{display:none;}
+  .kook-videoladen{display:flex; align-items:center; justify-content:center; height:100%; color:var(--muted); font-size:14px;}
   .kook-stapvak{flex:1;}
   .kook-stapnr{color:var(--accent); font-weight:800; font-size:15px; letter-spacing:.4px; margin-bottom:10px;}
   .kook-staptekst{font-size:26px; line-height:1.4; font-weight:500;}
@@ -717,7 +718,44 @@ async function startImport() {
 }
 
 // ---------- Kookmodus ----------
-function startKookmodus() {
+let KOOK_PLAYER = null;   // YouTube IFrame-speler (blijft leven tijdens een sessie)
+const KOOK_MARGE = 2;     // seconden vóór het tijdstip beginnen (aanloop meepakken)
+
+function stapStart(i) {
+  const st = KOOK_STAPPEN[i]?.start;
+  return st != null ? Math.max(0, st - KOOK_MARGE) : 0;
+}
+
+// Laadt de YouTube IFrame-API één keer.
+function laadYTApi() {
+  return new Promise((resolve) => {
+    if (window.YT && window.YT.Player) return resolve();
+    if (!document.getElementById("yt-api-script")) {
+      const tag = document.createElement("script");
+      tag.id = "yt-api-script";
+      tag.src = "https://www.youtube.com/iframe_api";
+      document.head.appendChild(tag);
+    }
+    const iv = setInterval(() => {
+      if (window.YT && window.YT.Player) { clearInterval(iv); resolve(); }
+    }, 100);
+    setTimeout(() => { clearInterval(iv); resolve(); }, 8000);
+  });
+}
+
+function maakSpeler(startSec) {
+  if (KOOK_PLAYER && KOOK_PLAYER.destroy) { try { KOOK_PLAYER.destroy(); } catch {} }
+  KOOK_PLAYER = null;
+  el("kook-video").innerHTML = '<div id="yt-player"></div>';
+  KOOK_PLAYER = new YT.Player("yt-player", {
+    videoId: KOOK_VIDEO_ID,
+    host: "https://www.youtube-nocookie.com",
+    playerVars: { playsinline: 1, rel: 0, modestbranding: 1, start: startSec, autoplay: 1 },
+    events: { onReady: (e) => { try { e.target.playVideo(); } catch {} } },
+  });
+}
+
+async function startKookmodus() {
   const r = HUIDIG_RECEPT;
   if (!r) return;
   KOOK_STAPPEN = normStappen(r.stappen);
@@ -725,11 +763,21 @@ function startKookmodus() {
   KOOK_VIDEO_ID = r.bron_type === "youtube" ? ytId(r.bron_url) : null;
   KOOK_INDEX = 0;
   el("kook-titel").textContent = r.titel;
-  el("kook-video").innerHTML = "";
   el("kook-overlay").classList.add("open");
   document.body.style.overflow = "hidden";
   wakeLockAan();
   toonKookStap();
+
+  const box = el("kook-video");
+  if (KOOK_VIDEO_ID) {
+    box.style.display = "";
+    box.innerHTML = '<div class="kook-videoladen">Video laden…</div>';
+    await laadYTApi();
+    if (el("kook-overlay").classList.contains("open") && KOOK_VIDEO_ID) maakSpeler(stapStart(0));
+  } else {
+    box.style.display = "none";
+    box.innerHTML = "";
+  }
 }
 
 function toonKookStap() {
@@ -740,34 +788,28 @@ function toonKookStap() {
   el("kook-bar-fill").style.width = ((KOOK_INDEX + 1) / n) * 100 + "%";
   el("kook-vorige").classList.toggle("verborgen", KOOK_INDEX === 0);
   el("kook-volgende").textContent = KOOK_INDEX === n - 1 ? "Klaar ✓" : "Volgende ›";
-
-  const box = el("kook-video");
-  if (KOOK_VIDEO_ID) {
-    if (s.start != null) laadKookVideo(s.start);        // sync naar dit tijdstip
-    else if (!box.querySelector("iframe")) laadKookVideo(0); // geen tijdstip: 1x laden
-    // anders: laat de video staan waar hij is
-  } else {
-    box.innerHTML = "";
-  }
   document.querySelector(".kook-body")?.scrollTo(0, 0);
 }
 
-function laadKookVideo(sec) {
-  const src = `https://www.youtube.com/embed/${KOOK_VIDEO_ID}` +
-    `?start=${sec}&autoplay=1&rel=0&modestbranding=1&playsinline=1`;
-  el("kook-video").innerHTML =
-    `<iframe src="${src}" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
+// Springt de lopende speler naar het tijdstip van de huidige stap (zonder herladen).
+function syncVideoNaarStap() {
+  if (!KOOK_VIDEO_ID || !KOOK_PLAYER || !KOOK_PLAYER.seekTo) return;
+  if (KOOK_STAPPEN[KOOK_INDEX].start == null) return;  // geen tijdstip: laat video staan
+  KOOK_PLAYER.seekTo(stapStart(KOOK_INDEX), true);
+  try { KOOK_PLAYER.playVideo(); } catch {}
 }
 
 function kookVolgende() {
-  if (KOOK_INDEX < KOOK_STAPPEN.length - 1) { KOOK_INDEX++; toonKookStap(); }
+  if (KOOK_INDEX < KOOK_STAPPEN.length - 1) { KOOK_INDEX++; toonKookStap(); syncVideoNaarStap(); }
   else { sluitKookmodus(); toast("Smakelijk eten! 🍽️"); }
 }
 function kookVorige() {
-  if (KOOK_INDEX > 0) { KOOK_INDEX--; toonKookStap(); }
+  if (KOOK_INDEX > 0) { KOOK_INDEX--; toonKookStap(); syncVideoNaarStap(); }
 }
 function sluitKookmodus() {
   el("kook-overlay").classList.remove("open");
+  if (KOOK_PLAYER && KOOK_PLAYER.destroy) { try { KOOK_PLAYER.destroy(); } catch {} }
+  KOOK_PLAYER = null;
   el("kook-video").innerHTML = "";   // stopt de video
   document.body.style.overflow = "";
   wakeLockUit();
