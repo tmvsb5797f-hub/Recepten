@@ -247,7 +247,18 @@ const RECEPT_SCHEMA = {
       },
     },
     benodigdheden: { type: "ARRAY", items: { type: "STRING" } },
-    stappen: { type: "ARRAY", items: { type: "STRING" } },
+    stappen: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          tekst: { type: "STRING" },
+          start: { type: "INTEGER" },
+        },
+        required: ["tekst", "start"],
+        propertyOrdering: ["tekst", "start"],
+      },
+    },
     tags: { type: "ARRAY", items: { type: "STRING" } },
   },
   required: ["is_recept", "titel", "ingredienten", "stappen"],
@@ -283,6 +294,15 @@ async function handleImport(request, env) {
     return json({ fout: "Geen recept gevonden in deze video." }, 422);
   }
 
+  // Stappen normaliseren naar { tekst, start(seconde of null) }.
+  const stappen = (Array.isArray(recept.stappen) ? recept.stappen : [])
+    .map((s) => {
+      if (typeof s === "string") return { tekst: s, start: null };
+      const start = Number.isInteger(s?.start) && s.start >= 0 ? s.start : null;
+      return { tekst: String(s?.tekst || ""), start };
+    })
+    .filter((s) => s.tekst);
+
   // Concept opbouwen — NIET opgeslagen, gebruiker reviewt eerst.
   return json({
     titel: recept.titel || "",
@@ -291,7 +311,7 @@ async function handleImport(request, env) {
     kooktijd: recept.kooktijd || "",
     ingredienten: Array.isArray(recept.ingredienten) ? recept.ingredienten : [],
     benodigdheden: Array.isArray(recept.benodigdheden) ? recept.benodigdheden : [],
-    stappen: Array.isArray(recept.stappen) ? recept.stappen : [],
+    stappen,
     tags: Array.isArray(recept.tags) ? recept.tags : [],
     bron_url: videoUrl,
     bron_type: "youtube",
@@ -319,7 +339,9 @@ function parseVideoId(url) {
 async function extractViaVideo(env, videoUrl) {
   const prompt =
     "Bekijk deze kookvideo (beeld en audio) en haal het complete recept eruit. " +
-    "Let ook op hoeveelheden die alleen in beeld getoond worden.\n\n" + RECEPT_REGELS;
+    "Let ook op hoeveelheden die alleen in beeld getoond worden.\n\n" + RECEPT_REGELS +
+    "\n- Geef bij elke stap 'start': het tijdstip in HELE SECONDEN vanaf het begin van de " +
+    "video waarop die stap begint. Gebruik -1 als je het tijdstip niet zeker weet.";
   return roepGemini(env, {
     contents: [{ parts: [{ file_data: { file_uri: videoUrl } }, { text: prompt }] }],
     generationConfig: { responseMimeType: "application/json", responseSchema: RECEPT_SCHEMA },
@@ -329,7 +351,9 @@ async function extractViaVideo(env, videoUrl) {
 async function extractViaTekst(env, tekst) {
   const prompt =
     "Hieronder staat de titel, beschrijving en/of transcriptie van een kookvideo. " +
-    "Haal hier het complete recept uit.\n\n" + RECEPT_REGELS + "\n\nBRON:\n" + tekst.slice(0, 30000);
+    "Haal hier het complete recept uit.\n\n" + RECEPT_REGELS +
+    "\n- Er is geen video-timing beschikbaar; zet 'start' op -1 voor elke stap." +
+    "\n\nBRON:\n" + tekst.slice(0, 30000);
   return roepGemini(env, {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: { responseMimeType: "application/json", responseSchema: RECEPT_SCHEMA },

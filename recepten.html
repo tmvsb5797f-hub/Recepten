@@ -161,6 +161,34 @@
   .spinner{width:44px; height:44px; margin:0 auto; border-radius:50%;
     border:4px solid var(--line); border-top-color:var(--accent); animation:spin .8s linear infinite;}
   @keyframes spin{to{transform:rotate(360deg);}}
+
+  /* Kookmodus */
+  .kook-knop{margin:2px 0 16px; padding:15px; font-size:16px;}
+  #kook-overlay{position:fixed; inset:0; z-index:70; background:var(--bg1); display:none; flex-direction:column;}
+  #kook-overlay.open{display:flex;}
+  .kook-top{display:flex; align-items:center; gap:12px; padding:calc(10px + env(safe-area-inset-top)) 16px 10px;}
+  .kook-sluit{width:40px; height:40px; flex:0 0 auto; border:1px solid var(--line); background:var(--card);
+    color:var(--txt); border-radius:12px; font-size:16px; cursor:pointer;}
+  .kook-titel{flex:1; font-weight:700; font-size:16px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .kook-bar{height:4px; background:var(--card);}
+  .kook-bar-fill{height:100%; background:var(--accent); width:0; transition:width .25s ease;}
+  .kook-body{flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:18px; padding:16px;}
+  .kook-video{width:100%; aspect-ratio:16/9; border-radius:16px; overflow:hidden; background:#000; flex:0 0 auto;}
+  .kook-video iframe{width:100%; height:100%; border:0; display:block;}
+  .kook-video:empty{display:none;}
+  .kook-stapvak{flex:1;}
+  .kook-stapnr{color:var(--accent); font-weight:800; font-size:15px; letter-spacing:.4px; margin-bottom:10px;}
+  .kook-staptekst{font-size:26px; line-height:1.4; font-weight:500;}
+  .kook-nav{display:flex; gap:12px; padding:12px 16px calc(14px + env(safe-area-inset-bottom)); border-top:1px solid var(--line);}
+  .kook-nav .btn{flex:1; padding:18px 10px; font-size:17px;}
+  #kook-vorige.verborgen{visibility:hidden;}
+  @media (min-width:820px){
+    .kook-body{flex-direction:row; align-items:flex-start; gap:24px; padding:24px; max-width:1120px; margin:0 auto; width:100%;}
+    .kook-video{width:58%; position:sticky; top:0;}
+    .kook-stapvak{flex:1; padding-top:4px;}
+    .kook-staptekst{font-size:30px;}
+    .kook-nav{max-width:1120px; margin:0 auto; width:100%;}
+  }
 </style>
 </head>
 <body>
@@ -299,6 +327,26 @@
   </div>
 </div>
 
+<!-- ===== KOOKMODUS ===== -->
+<div id="kook-overlay">
+  <div class="kook-top">
+    <button class="kook-sluit" id="kook-sluit" title="Sluiten">✕</button>
+    <div class="kook-titel" id="kook-titel"></div>
+  </div>
+  <div class="kook-bar"><div class="kook-bar-fill" id="kook-bar-fill"></div></div>
+  <div class="kook-body">
+    <div class="kook-video" id="kook-video"></div>
+    <div class="kook-stapvak">
+      <div class="kook-stapnr" id="kook-stapnr"></div>
+      <div class="kook-staptekst" id="kook-staptekst"></div>
+    </div>
+  </div>
+  <div class="kook-nav">
+    <button class="btn ghost" id="kook-vorige">‹ Vorige</button>
+    <button class="btn primary" id="kook-volgende">Volgende ›</button>
+  </div>
+</div>
+
 <script>
 // ===================================================================
 //  CONFIG — pas dit aan na het deployen van de Worker
@@ -311,10 +359,27 @@ let RECEPTEN = [];        // cache
 let ACTIEF_FILTER = "";   // geselecteerde tag
 let BEWERK_ID = null;     // id bij bewerken, anders null
 let FORM_BRON = { afbeelding: "", bron_type: "handmatig", bron_url: "" }; // meta buiten de formuliervelden
+let FORM_STAP_STARTS = [];  // tijdstippen per stap (index-gebonden), voor behoud bij bewerken
+let HUIDIG_RECEPT = null;   // recept in de detailweergave (voor kookmodus)
+let KOOK_STAPPEN = [], KOOK_INDEX = 0, KOOK_VIDEO_ID = null, wakeLock = null;
 
 const el = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// Stappen kunnen strings (oud) of {tekst,start} (nieuw) zijn -> altijd {tekst,start}.
+function normStappen(arr) {
+  return (arr || []).map((s) =>
+    typeof s === "string"
+      ? { tekst: s, start: null }
+      : { tekst: (s && s.tekst) || "", start: (s && typeof s.start === "number" && s.start >= 0) ? s.start : null }
+  ).filter((s) => s.tekst);
+}
+// Video-id uit een YouTube-URL.
+function ytId(url) {
+  const m = String(url || "").match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
 
 // ---------- token / api ----------
 const getToken = () => localStorage.getItem(TOKEN_KEY) || "";
@@ -459,6 +524,8 @@ async function openDetail(id) {
 }
 
 function renderDetail(r) {
+  HUIDIG_RECEPT = r;
+  const stapLijst = normStappen(r.stappen);
   el("detail-bewerk").onclick = () => openFormulier(r);
   el("detail-verwijder").onclick = () => verwijder(r);
 
@@ -485,9 +552,13 @@ function renderDetail(r) {
       r.benodigdheden.map((b) => `<span class="minichip">${esc(b)}</span>`).join("") + `</div></div>`
     : "";
 
-  const stappen = (r.stappen || []).length
+  const stappen = stapLijst.length
     ? `<div class="blok"><h4>👩‍🍳 Bereidingswijze</h4><ol class="stap-lijst">` +
-      r.stappen.map((s) => `<li>${esc(s)}</li>`).join("") + `</ol></div>`
+      stapLijst.map((s) => `<li>${esc(s.tekst)}</li>`).join("") + `</ol></div>`
+    : "";
+
+  const kookKnop = stapLijst.length
+    ? `<button class="btn primary block kook-knop" id="kook-start-btn">👨‍🍳 Start kookmodus</button>`
     : "";
 
   const tags = (r.tags || []).length
@@ -507,7 +578,9 @@ function renderDetail(r) {
     hero +
     `<h2 class="titel">${esc(r.titel)}</h2>` +
     (meta.length ? `<div class="detail-meta">${meta.join("")}</div>` : "") +
-    tags + ingr + benod + stappen + notities + bron;
+    tags + kookKnop + ingr + benod + stappen + notities + bron;
+
+  if (stapLijst.length) el("kook-start-btn").onclick = startKookmodus;
 }
 
 async function verwijder(r) {
@@ -548,7 +621,9 @@ function openFormulier(r = null) {
   el("f-porties").value = r?.porties || "";
   el("f-bereidingstijd").value = r?.bereidingstijd || "";
   el("f-kooktijd").value = r?.kooktijd || "";
-  el("f-stappen").value = (r?.stappen || []).join("\n");
+  const stapLijst = normStappen(r?.stappen);
+  el("f-stappen").value = stapLijst.map((s) => s.tekst).join("\n");
+  FORM_STAP_STARTS = stapLijst.map((s) => s.start);
   el("f-benodigdheden").value = (r?.benodigdheden || []).join(", ");
   el("f-tags").value = (r?.tags || []).join(", ");
   el("f-bron").value = r?.bron_url || "";
@@ -576,7 +651,10 @@ function leesFormulier() {
     bereidingstijd: el("f-bereidingstijd").value.trim(),
     kooktijd: el("f-kooktijd").value.trim(),
     ingredienten,
-    stappen: splitRegel(el("f-stappen").value),
+    // Behoud tijdstippen per stap op index; nieuwe/extra regels krijgen null.
+    stappen: splitRegel(el("f-stappen").value).map((tekst, i) => ({
+      tekst, start: FORM_STAP_STARTS[i] ?? null,
+    })),
     benodigdheden: splitKomma(el("f-benodigdheden").value),
     tags: splitKomma(el("f-tags").value),
     bron_url: el("f-bron").value.trim(),
@@ -638,6 +716,71 @@ async function startImport() {
   }
 }
 
+// ---------- Kookmodus ----------
+function startKookmodus() {
+  const r = HUIDIG_RECEPT;
+  if (!r) return;
+  KOOK_STAPPEN = normStappen(r.stappen);
+  if (!KOOK_STAPPEN.length) return toast("Dit recept heeft geen stappen", true);
+  KOOK_VIDEO_ID = r.bron_type === "youtube" ? ytId(r.bron_url) : null;
+  KOOK_INDEX = 0;
+  el("kook-titel").textContent = r.titel;
+  el("kook-video").innerHTML = "";
+  el("kook-overlay").classList.add("open");
+  document.body.style.overflow = "hidden";
+  wakeLockAan();
+  toonKookStap();
+}
+
+function toonKookStap() {
+  const n = KOOK_STAPPEN.length;
+  const s = KOOK_STAPPEN[KOOK_INDEX];
+  el("kook-stapnr").textContent = `Stap ${KOOK_INDEX + 1} van ${n}`;
+  el("kook-staptekst").textContent = s.tekst;
+  el("kook-bar-fill").style.width = ((KOOK_INDEX + 1) / n) * 100 + "%";
+  el("kook-vorige").classList.toggle("verborgen", KOOK_INDEX === 0);
+  el("kook-volgende").textContent = KOOK_INDEX === n - 1 ? "Klaar ✓" : "Volgende ›";
+
+  const box = el("kook-video");
+  if (KOOK_VIDEO_ID) {
+    if (s.start != null) laadKookVideo(s.start);        // sync naar dit tijdstip
+    else if (!box.querySelector("iframe")) laadKookVideo(0); // geen tijdstip: 1x laden
+    // anders: laat de video staan waar hij is
+  } else {
+    box.innerHTML = "";
+  }
+  document.querySelector(".kook-body")?.scrollTo(0, 0);
+}
+
+function laadKookVideo(sec) {
+  const src = `https://www.youtube.com/embed/${KOOK_VIDEO_ID}` +
+    `?start=${sec}&autoplay=1&rel=0&modestbranding=1&playsinline=1`;
+  el("kook-video").innerHTML =
+    `<iframe src="${src}" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
+}
+
+function kookVolgende() {
+  if (KOOK_INDEX < KOOK_STAPPEN.length - 1) { KOOK_INDEX++; toonKookStap(); }
+  else { sluitKookmodus(); toast("Smakelijk eten! 🍽️"); }
+}
+function kookVorige() {
+  if (KOOK_INDEX > 0) { KOOK_INDEX--; toonKookStap(); }
+}
+function sluitKookmodus() {
+  el("kook-overlay").classList.remove("open");
+  el("kook-video").innerHTML = "";   // stopt de video
+  document.body.style.overflow = "";
+  wakeLockUit();
+}
+
+async function wakeLockAan() {
+  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+}
+function wakeLockUit() {
+  try { wakeLock && wakeLock.release(); } catch {}
+  wakeLock = null;
+}
+
 // ---------- events ----------
 el("login-knop").addEventListener("click", doeLogin);
 el("pin").addEventListener("keydown", (e) => { if (e.key === "Enter") doeLogin(); });
@@ -648,6 +791,18 @@ el("import-start").addEventListener("click", startImport);
 el("import-annuleren").addEventListener("click", sluitImport);
 el("import-url").addEventListener("keydown", (e) => { if (e.key === "Enter") startImport(); });
 el("import-overlay").addEventListener("click", (e) => { if (e.target === el("import-overlay")) sluitImport(); });
+el("kook-sluit").addEventListener("click", sluitKookmodus);
+el("kook-volgende").addEventListener("click", kookVolgende);
+el("kook-vorige").addEventListener("click", kookVorige);
+document.addEventListener("keydown", (e) => {
+  if (!el("kook-overlay").classList.contains("open")) return;
+  if (e.key === "ArrowRight") kookVolgende();
+  else if (e.key === "ArrowLeft") kookVorige();
+  else if (e.key === "Escape") sluitKookmodus();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && el("kook-overlay").classList.contains("open")) wakeLockAan();
+});
 el("zoek").addEventListener("input", renderLijst);
 el("detail-terug").addEventListener("click", naarLijst);
 el("form-terug").addEventListener("click", () => BEWERK_ID ? openDetail(BEWERK_ID) : naarLijst());
