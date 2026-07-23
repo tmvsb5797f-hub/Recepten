@@ -26,7 +26,7 @@ wrangler deploy
 
 ## Frontend koppelen
 
-Zet de Worker-URL bovenaan in `../recepten.html`:
+Zet de Worker-URL bovenaan in `../index.html`:
 
 ```js
 const API_BASE = "https://recepten-api.<jouw-subdomein>.workers.dev";
@@ -39,10 +39,10 @@ const API_BASE = "https://recepten-api.<jouw-subdomein>.workers.dev";
 ```bash
 cd ..                       # naar de repo-root
 python3 -m http.server 8080
-# open http://localhost:8080/recepten.html   (origin staat al in de allowlist)
+# open http://localhost:8080/   (origin staat al in de allowlist)
 ```
 
-Of push `recepten.html` naar GitHub Pages (die origin staat ook in de allowlist).
+Of push `index.html` naar GitHub Pages (die origin staat ook in de allowlist).
 
 ## Endpoints
 
