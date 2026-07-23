@@ -1,0 +1,15 @@
+name = "recepten-api"
+main = "index.js"
+compatibility_date = "2024-09-01"
+
+# D1-database. Vul database_id in met de waarde die je krijgt bij
+#   wrangler d1 create recepten
+[[d1_databases]]
+binding = "DB"
+database_name = "recepten"
+database_id = "d94d59b1-4389-465c-aaff-348306aaaa13"
+
+# Secrets (NIET hier zetten). Instellen met:
+#   wrangler secret put APP_PIN         -> jouw inlog-PIN
+#   wrangler secret put TOKEN_SECRET    -> lange willekeurige string voor tokens
+#   wrangler secret put GEMINI_KEY      -> pas nodig in Fase 2
