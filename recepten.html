@@ -141,6 +141,26 @@
   #toast.err{border-color:var(--err); color:#ffd7d3;}
 
   .laden{text-align:center; color:var(--muted); padding:34px; font-size:15px;}
+
+  /* Import-overlay */
+  #import-overlay{position:fixed; inset:0; background:rgba(10,7,4,.7); backdrop-filter:blur(3px);
+    display:none; align-items:flex-end; justify-content:center; z-index:60;}
+  #import-overlay.open{display:flex;}
+  .sheet{width:100%; max-width:640px; background:linear-gradient(180deg,var(--card2),var(--card));
+    border:1px solid var(--line); border-bottom:none; border-radius:22px 22px 0 0; padding:22px 18px calc(22px + env(safe-area-inset-bottom));
+    box-shadow:0 -12px 40px rgba(0,0,0,.5); animation:sheetUp .22s ease;}
+  @keyframes sheetUp{from{transform:translateY(30px); opacity:.6;}to{transform:none; opacity:1;}}
+  .sheet h3{margin:0 0 6px; font-size:19px;}
+  .sub{color:var(--muted); font-size:13px; line-height:1.5; margin:0 0 14px;}
+  .sheet-acties{display:flex; gap:10px; margin-top:14px;}
+  .sheet-acties .btn{flex:1;}
+  .import-fout{color:var(--err); font-size:13.5px; margin-top:10px; min-height:0; line-height:1.4;}
+  #import-laden{display:none; text-align:center; padding:16px 0 8px;}
+  #import-laden .sub{margin-top:2px;}
+  .laad-tekst{font-size:16px; font-weight:600; margin:14px 0 0;}
+  .spinner{width:44px; height:44px; margin:0 auto; border-radius:50%;
+    border:4px solid var(--line); border-top-color:var(--accent); animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
 </style>
 </head>
 <body>
@@ -258,6 +278,27 @@
 
 <div id="toast"></div>
 
+<!-- ===== IMPORT-OVERLAY ===== -->
+<div id="import-overlay">
+  <div class="sheet">
+    <div id="import-form">
+      <h3>Recept uit YouTube</h3>
+      <p class="sub">Plak een link naar een kookvideo. Gemini bekijkt de video en maakt er een concept van dat je daarna kunt aanpassen.</p>
+      <input id="import-url" type="url" inputmode="url" placeholder="https://www.youtube.com/watch?v=…" autocomplete="off"/>
+      <div id="import-fout" class="import-fout"></div>
+      <div class="sheet-acties">
+        <button class="btn ghost" id="import-annuleren">Annuleren</button>
+        <button class="btn primary" id="import-start">Haal recept op</button>
+      </div>
+    </div>
+    <div id="import-laden">
+      <div class="spinner"></div>
+      <p class="laad-tekst">Video wordt geanalyseerd…</p>
+      <p class="sub">Beeld én audio worden gelezen. Dit kan tot ~40 seconden duren.</p>
+    </div>
+  </div>
+</div>
+
 <script>
 // ===================================================================
 //  CONFIG — pas dit aan na het deployen van de Worker
@@ -269,6 +310,7 @@ const TOKEN_KEY = "recepten_token";
 let RECEPTEN = [];        // cache
 let ACTIEF_FILTER = "";   // geselecteerde tag
 let BEWERK_ID = null;     // id bij bewerken, anders null
+let FORM_BRON = { afbeelding: "", bron_type: "handmatig", bron_url: "" }; // meta buiten de formuliervelden
 
 const el = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -493,8 +535,15 @@ function ingrRij(ingr = {}) {
 }
 
 function openFormulier(r = null) {
-  BEWERK_ID = r ? r.id : null;
-  el("form-titel").textContent = r ? "Recept bewerken" : "Nieuw recept";
+  BEWERK_ID = r && r.id ? r.id : null;
+  el("form-titel").textContent = BEWERK_ID
+    ? "Recept bewerken"
+    : (r ? "Concept — controleer & sla op" : "Nieuw recept");
+  FORM_BRON = {
+    afbeelding: r?.afbeelding || "",
+    bron_type: r?.bron_type || "handmatig",
+    bron_url: r?.bron_url || "",
+  };
   el("f-titel").value = r?.titel || "";
   el("f-porties").value = r?.porties || "";
   el("f-bereidingstijd").value = r?.bereidingstijd || "";
@@ -532,9 +581,8 @@ function leesFormulier() {
     tags: splitKomma(el("f-tags").value),
     bron_url: el("f-bron").value.trim(),
     notities: el("f-notities").value.trim(),
-    bron_type: BEWERK_ID
-      ? (RECEPTEN.find((x) => x.id === BEWERK_ID)?.bron_type || "handmatig")
-      : "handmatig",
+    bron_type: FORM_BRON.bron_type,
+    afbeelding: FORM_BRON.afbeelding,
   };
 }
 
@@ -558,13 +606,48 @@ async function bewaar() {
   }
 }
 
+// ---------- YouTube-import ----------
+function openImport() {
+  el("import-url").value = "";
+  el("import-fout").textContent = "";
+  el("import-form").style.display = "block";
+  el("import-laden").style.display = "none";
+  el("import-overlay").classList.add("open");
+  setTimeout(() => el("import-url").focus(), 50);
+}
+function sluitImport() {
+  el("import-overlay").classList.remove("open");
+}
+async function startImport() {
+  const url = el("import-url").value.trim();
+  if (!url) return;
+  el("import-fout").textContent = "";
+  el("import-form").style.display = "none";
+  el("import-laden").style.display = "block";
+  try {
+    const concept = await api("/api/import", { method: "POST", body: JSON.stringify({ url }) });
+    sluitImport();
+    openFormulier(concept);
+    toast(concept._methode === "transcript"
+      ? "Recept uit transcript — controleer en sla op"
+      : "Recept uit video — controleer en sla op");
+  } catch (e) {
+    el("import-laden").style.display = "none";
+    el("import-form").style.display = "block";
+    el("import-fout").textContent = e.message;
+  }
+}
+
 // ---------- events ----------
 el("login-knop").addEventListener("click", doeLogin);
 el("pin").addEventListener("keydown", (e) => { if (e.key === "Enter") doeLogin(); });
 el("nieuw-knop").addEventListener("click", () => openFormulier(null));
 el("uitlog-knop").addEventListener("click", () => { setToken(""); toonScherm("login"); });
-el("import-knop").addEventListener("click", () =>
-  toast("YouTube-import komt in Fase 2 🎬"));
+el("import-knop").addEventListener("click", openImport);
+el("import-start").addEventListener("click", startImport);
+el("import-annuleren").addEventListener("click", sluitImport);
+el("import-url").addEventListener("keydown", (e) => { if (e.key === "Enter") startImport(); });
+el("import-overlay").addEventListener("click", (e) => { if (e.target === el("import-overlay")) sluitImport(); });
 el("zoek").addEventListener("input", renderLijst);
 el("detail-terug").addEventListener("click", naarLijst);
 el("form-terug").addEventListener("click", () => BEWERK_ID ? openDetail(BEWERK_ID) : naarLijst());

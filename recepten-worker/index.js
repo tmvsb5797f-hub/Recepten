@@ -47,6 +47,10 @@ async function route(request, env, url) {
     return json({ fout: "Niet ingelogd" }, 401);
   }
 
+  if (path === "/api/import" && method === "POST") {
+    return handleImport(request, env);
+  }
+
   if (path === "/api/recepten") {
     if (method === "GET") return listRecepten(env);
     if (method === "POST") return createRecept(request, env);
@@ -202,6 +206,227 @@ function schoonRecept(body) {
     tags: lijst(body.tags),
     notities: tekst(body.notities),
   };
+}
+
+// ---------- import (YouTube -> Gemini) ----------
+
+// Fallback-keten: elk model-id heeft een eigen rate-limit-bucket (tokens/min).
+// Bij 429/overbelasting/onbeschikbaar valt hij automatisch door naar het volgende.
+const MODELLEN = ["gemini-2.5-flash", "gemini-flash-lite-latest"];
+
+const RECEPT_REGELS =
+  "Regels:\n" +
+  "- Schrijf alles in het Nederlands.\n" +
+  "- Gebruik metrische eenheden.\n" +
+  "- Splits elk ingredient in hoeveelheid, eenheid en naam. Als een hoeveelheid niet genoemd of getoond wordt, laat 'hoeveelheid' en 'eenheid' leeg. Verzin niets.\n" +
+  "- Schrijf de stappen als heldere, korte gebiedende zinnen.\n" +
+  "- Verzin geen ingredienten of stappen die niet in de bron voorkomen.\n" +
+  "- Bedenk 2 tot 4 passende tags.\n" +
+  "- Als de bron geen recept bevat, zet is_recept op false en laat de rest leeg.";
+
+const RECEPT_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    is_recept: { type: "BOOLEAN" },
+    titel: { type: "STRING" },
+    porties: { type: "STRING" },
+    bereidingstijd: { type: "STRING" },
+    kooktijd: { type: "STRING" },
+    ingredienten: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          hoeveelheid: { type: "STRING" },
+          eenheid: { type: "STRING" },
+          naam: { type: "STRING" },
+          opmerking: { type: "STRING" },
+        },
+        required: ["naam"],
+        propertyOrdering: ["hoeveelheid", "eenheid", "naam", "opmerking"],
+      },
+    },
+    benodigdheden: { type: "ARRAY", items: { type: "STRING" } },
+    stappen: { type: "ARRAY", items: { type: "STRING" } },
+    tags: { type: "ARRAY", items: { type: "STRING" } },
+  },
+  required: ["is_recept", "titel", "ingredienten", "stappen"],
+  propertyOrdering: [
+    "is_recept", "titel", "porties", "bereidingstijd", "kooktijd",
+    "ingredienten", "benodigdheden", "stappen", "tags",
+  ],
+};
+
+async function handleImport(request, env) {
+  if (!env.GEMINI_KEY) return json({ fout: "GEMINI_KEY niet ingesteld op de server" }, 500);
+  const body = await readJson(request);
+  const videoId = parseVideoId(String(body.url || "").trim());
+  if (!videoId) return json({ fout: "Geen geldige YouTube-URL" }, 400);
+  const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
+
+  let recept, methode;
+  try {
+    recept = await extractViaVideo(env, videoUrl);   // primaire route: video
+    methode = "video";
+  } catch (eVideo) {
+    try {
+      const tekst = await haalYoutubeTekst(videoId); // fallback: beschrijving + transcript
+      if (!tekst) throw new Error("geen tekst beschikbaar");
+      recept = await extractViaTekst(env, tekst);
+      methode = "transcript";
+    } catch (eTekst) {
+      return json({ fout: "Kon dit recept niet uit de video halen. " + (eVideo.message || "") }, 502);
+    }
+  }
+
+  if (!recept || recept.is_recept === false || !recept.titel) {
+    return json({ fout: "Geen recept gevonden in deze video." }, 422);
+  }
+
+  // Concept opbouwen — NIET opgeslagen, gebruiker reviewt eerst.
+  return json({
+    titel: recept.titel || "",
+    porties: recept.porties || "",
+    bereidingstijd: recept.bereidingstijd || "",
+    kooktijd: recept.kooktijd || "",
+    ingredienten: Array.isArray(recept.ingredienten) ? recept.ingredienten : [],
+    benodigdheden: Array.isArray(recept.benodigdheden) ? recept.benodigdheden : [],
+    stappen: Array.isArray(recept.stappen) ? recept.stappen : [],
+    tags: Array.isArray(recept.tags) ? recept.tags : [],
+    bron_url: videoUrl,
+    bron_type: "youtube",
+    afbeelding: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    notities: "",
+    _methode: methode,
+  });
+}
+
+function parseVideoId(url) {
+  if (!url) return null;
+  const patronen = [
+    /[?&]v=([A-Za-z0-9_-]{11})/,
+    /youtu\.be\/([A-Za-z0-9_-]{11})/,
+    /youtube\.com\/(?:embed|shorts|live)\/([A-Za-z0-9_-]{11})/,
+  ];
+  for (const p of patronen) {
+    const m = url.match(p);
+    if (m) return m[1];
+  }
+  if (/^[A-Za-z0-9_-]{11}$/.test(url)) return url; // kale video-id
+  return null;
+}
+
+async function extractViaVideo(env, videoUrl) {
+  const prompt =
+    "Bekijk deze kookvideo (beeld en audio) en haal het complete recept eruit. " +
+    "Let ook op hoeveelheden die alleen in beeld getoond worden.\n\n" + RECEPT_REGELS;
+  return roepGemini(env, {
+    contents: [{ parts: [{ file_data: { file_uri: videoUrl } }, { text: prompt }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: RECEPT_SCHEMA },
+  });
+}
+
+async function extractViaTekst(env, tekst) {
+  const prompt =
+    "Hieronder staat de titel, beschrijving en/of transcriptie van een kookvideo. " +
+    "Haal hier het complete recept uit.\n\n" + RECEPT_REGELS + "\n\nBRON:\n" + tekst.slice(0, 30000);
+  return roepGemini(env, {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: "application/json", responseSchema: RECEPT_SCHEMA },
+  });
+}
+
+async function roepGemini(env, requestBody) {
+  let laatsteFout;
+  for (const model of MODELLEN) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_KEY}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) }
+    );
+    // Rate-limit / overbelasting / model onbeschikbaar -> volgend model (eigen bucket).
+    if (res.status === 429 || res.status === 503 || res.status === 404) {
+      laatsteFout = new Error(`${model} gaf HTTP ${res.status}`);
+      continue;
+    }
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.error?.message || "Gemini-fout " + res.status);
+    const tekst = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!tekst) throw new Error("Gemini gaf geen bruikbaar antwoord");
+    try {
+      return JSON.parse(tekst);
+    } catch {
+      throw new Error("Gemini-antwoord was geen geldige JSON");
+    }
+  }
+  throw laatsteFout || new Error("Geen Gemini-model beschikbaar");
+}
+
+// Fallback: haal titel + beschrijving + (indien beschikbaar) transcript uit de watch-pagina.
+async function haalYoutubeTekst(videoId) {
+  const res = await fetch("https://www.youtube.com/watch?v=" + videoId, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+      "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+    },
+  });
+  if (!res.ok) return "";
+  const html = await res.text();
+  const pr = haalJsonObject(html, "ytInitialPlayerResponse");
+  if (!pr) return "";
+  const vd = pr.videoDetails || {};
+  const tracks = pr.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+  const transcript = await haalTranscript(tracks);
+  const delen = [];
+  if (vd.title) delen.push("Titel: " + vd.title);
+  if (vd.shortDescription) delen.push("Beschrijving:\n" + vd.shortDescription);
+  if (transcript) delen.push("Transcriptie:\n" + transcript);
+  return delen.join("\n\n");
+}
+
+async function haalTranscript(tracks) {
+  if (!tracks.length) return "";
+  const track =
+    tracks.find((t) => t.languageCode === "nl") ||
+    tracks.find((t) => (t.languageCode || "").startsWith("en")) ||
+    tracks[0];
+  try {
+    const res = await fetch(track.baseUrl + "&fmt=json3");
+    if (!res.ok) return "";
+    const data = await res.json();
+    if (!data.events) return "";
+    return data.events
+      .flatMap((e) => (e.segs || []).map((s) => s.utf8 || ""))
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
+  } catch {
+    return "";
+  }
+}
+
+// Balans-matcht het eerste { } object na een marker in de HTML.
+function haalJsonObject(html, marker) {
+  const start = html.indexOf(marker);
+  if (start === -1) return null;
+  const i = html.indexOf("{", start);
+  if (i === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let j = i; j < html.length; j++) {
+    const c = html[j];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") {
+      if (--depth === 0) {
+        try { return JSON.parse(html.slice(i, j + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
 }
 
 // ---------- utils ----------
